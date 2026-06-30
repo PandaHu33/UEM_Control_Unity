@@ -5,10 +5,18 @@ using System.IO;
 using System.Net.Sockets;
 using System.Text;
 using UnityEngine;
+using UnityEngine.XR;
 using UnityEngine.XR.Hands;
 
 public sealed class WristPoseTcpSender : MonoBehaviour
 {
+    public enum PoseInputSource
+    {
+        XRHandWrist,
+        RightController,
+        Both,
+    }
+
     [SerializeField]
     string m_Host = "127.0.0.1";
 
@@ -23,6 +31,9 @@ public sealed class WristPoseTcpSender : MonoBehaviour
 
     [SerializeField]
     bool m_SendRightHand = true;
+
+    [SerializeField]
+    PoseInputSource m_InputSource = PoseInputSource.Both;
 
     [SerializeField]
     bool m_ControlEnabled;
@@ -54,6 +65,12 @@ public sealed class WristPoseTcpSender : MonoBehaviour
 
     public bool ControlEnabled => m_ControlEnabled;
 
+    public PoseInputSource InputSource
+    {
+        get => m_InputSource;
+        set => m_InputSource = value;
+    }
+
     public void SetControlEnabled(bool enabled)
     {
         if (m_ControlEnabled == enabled)
@@ -64,9 +81,9 @@ public sealed class WristPoseTcpSender : MonoBehaviour
         if (!m_ControlEnabled && m_Stream != null)
         {
             if (m_SendLeftHand)
-                SendLine(FormatUnavailable("left"));
+                SendLine(FormatUnavailable("left", "xr_hand_wrist", false));
             if (m_SendRightHand)
-                SendLine(FormatUnavailable("right"));
+                SendLine(FormatUnavailable("right", "xr_hand_wrist", false));
         }
 
         if (m_LogConnection)
@@ -83,26 +100,41 @@ public sealed class WristPoseTcpSender : MonoBehaviour
 
         m_NextSendTime = Time.unscaledTime + 1f / Mathf.Max(1f, m_SendHz);
 
-        if (!m_ControlEnabled)
+        if (SendsHandWrist())
         {
-            if (m_SendLeftHand)
-                SendLine(FormatUnavailable("left"));
-            if (m_SendRightHand)
-                SendLine(FormatUnavailable("right"));
-            return;
+            if (!m_ControlEnabled)
+            {
+                if (m_SendLeftHand)
+                    SendLine(FormatUnavailable("left", "xr_hand_wrist", false));
+                if (m_SendRightHand)
+                    SendLine(FormatUnavailable("right", "xr_hand_wrist", false));
+            }
+            else if (m_HandSubsystem == null || !m_HandSubsystem.running)
+            {
+                SendLine(FormatUnavailable("right", "xr_hand_wrist", false));
+            }
+            else
+            {
+                if (m_SendLeftHand)
+                    SendHand("left", m_HandSubsystem.leftHand);
+
+                if (m_SendRightHand)
+                    SendHand("right", m_HandSubsystem.rightHand);
+            }
         }
 
-        if (m_HandSubsystem == null || !m_HandSubsystem.running)
-        {
-            SendLine(FormatUnavailable("right"));
-            return;
-        }
+        if (SendsRightController())
+            SendRightController();
+    }
 
-        if (m_SendLeftHand)
-            SendHand("left", m_HandSubsystem.leftHand);
+    bool SendsHandWrist()
+    {
+        return m_InputSource == PoseInputSource.XRHandWrist || m_InputSource == PoseInputSource.Both;
+    }
 
-        if (m_SendRightHand)
-            SendHand("right", m_HandSubsystem.rightHand);
+    bool SendsRightController()
+    {
+        return m_InputSource == PoseInputSource.RightController || m_InputSource == PoseInputSource.Both;
     }
 
     void EnsureSubsystem()
@@ -159,44 +191,92 @@ public sealed class WristPoseTcpSender : MonoBehaviour
     {
         if (!hand.isTracked)
         {
-            SendLine(FormatUnavailable(handedness + "_not_tracked"));
+            SendLine(FormatUnavailable(handedness, "xr_hand_wrist", false));
             return;
         }
 
         var wrist = hand.GetJoint(XRHandJointID.Wrist);
         if (!wrist.TryGetPose(out var pose))
         {
-            SendLine(FormatUnavailable(handedness + "_wrist_pose_unavailable"));
+            SendLine(FormatUnavailable(handedness, "xr_hand_wrist", false));
             return;
         }
 
-        var p = pose.position;
-        var q = pose.rotation;
+        SendPose(handedness, "xr_hand_wrist", true, pose.position, pose.rotation, false);
+    }
+
+    void SendRightController()
+    {
+        var deadman = IsLeftDeadmanPressed();
+        var device = InputDevices.GetDeviceAtXRNode(XRNode.RightHand);
+        if (!device.isValid)
+        {
+            SendLine(FormatUnavailable("right", "right_controller", deadman));
+            return;
+        }
+
+        var tracked = true;
+        if (device.TryGetFeatureValue(CommonUsages.isTracked, out bool isTracked))
+            tracked = isTracked;
+
+        var hasPosition = device.TryGetFeatureValue(CommonUsages.devicePosition, out Vector3 position);
+        var hasRotation = device.TryGetFeatureValue(CommonUsages.deviceRotation, out Quaternion rotation);
+        if (!tracked || !hasPosition || !hasRotation)
+        {
+            SendLine(FormatUnavailable("right", "right_controller", deadman));
+            return;
+        }
+
+        SendPose("right", "right_controller", true, position, rotation, deadman);
+    }
+
+    bool IsLeftDeadmanPressed()
+    {
+        var device = InputDevices.GetDeviceAtXRNode(XRNode.LeftHand);
+        return device.isValid &&
+               device.TryGetFeatureValue(CommonUsages.primaryButton, out bool pressed) &&
+               pressed;
+    }
+
+    void SendPose(string handedness, string source, bool tracked, Vector3 position, Quaternion rotation, bool deadman)
+    {
+        var p = position;
+        var q = rotation;
         var line = string.Format(
             CultureInfo.InvariantCulture,
-            "{0},{1:F6},{2},1,{3:F6},{4:F6},{5:F6},{6:F6},{7:F6},{8:F6},{9:F6}",
+            "{0},{1:F6},{2},{3},{4:F6},{5:F6},{6:F6},{7:F6},{8:F6},{9:F6},{10:F6},{11},{12}",
             m_Sequence++,
             Time.realtimeSinceStartupAsDouble,
             handedness,
+            tracked ? 1 : 0,
             p.x,
             p.y,
             p.z,
             q.x,
             q.y,
             q.z,
-            q.w);
+            q.w,
+            source,
+            deadman ? 1 : 0);
 
         SendLine(line);
     }
 
     string FormatUnavailable(string handedness)
     {
+        return FormatUnavailable(handedness, "xr_hand_wrist", false);
+    }
+
+    string FormatUnavailable(string handedness, string source, bool deadman)
+    {
         return string.Format(
             CultureInfo.InvariantCulture,
-            "{0},{1:F6},{2},0,0,0,0,0,0,0,1",
+            "{0},{1:F6},{2},0,0,0,0,0,0,0,1,{3},{4}",
             m_Sequence++,
             Time.realtimeSinceStartupAsDouble,
-            handedness);
+            handedness,
+            source,
+            deadman ? 1 : 0);
     }
 
     void SendLine(string line)
