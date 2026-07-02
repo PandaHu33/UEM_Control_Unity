@@ -41,6 +41,12 @@ public sealed class WristPoseTcpSender : MonoBehaviour
     [SerializeField]
     bool m_LogConnection = true;
 
+    [SerializeField, Range(0f, 1f)]
+    float m_LeftFistOnThreshold = 0.72f;
+
+    [SerializeField, Range(0f, 1f)]
+    float m_LeftFistOffThreshold = 0.58f;
+
     static readonly List<XRHandSubsystem> s_HandSubsystems = new List<XRHandSubsystem>();
 
     XRHandSubsystem m_HandSubsystem;
@@ -49,6 +55,7 @@ public sealed class WristPoseTcpSender : MonoBehaviour
     float m_NextSendTime;
     float m_NextConnectAttemptTime;
     uint m_Sequence;
+    bool m_LeftFistActive;
     readonly byte[] m_Newline = { (byte)'\n' };
 
     public string Host
@@ -78,14 +85,6 @@ public sealed class WristPoseTcpSender : MonoBehaviour
 
         m_ControlEnabled = enabled;
 
-        if (!m_ControlEnabled && m_Stream != null)
-        {
-            if (m_SendLeftHand)
-                SendLine(FormatUnavailable("left", "xr_hand_wrist", false));
-            if (m_SendRightHand)
-                SendLine(FormatUnavailable("right", "xr_hand_wrist", false));
-        }
-
         if (m_LogConnection)
             Debug.Log($"WristPoseTcpSender control={(m_ControlEnabled ? 1 : 0)}", this);
     }
@@ -102,24 +101,19 @@ public sealed class WristPoseTcpSender : MonoBehaviour
 
         if (SendsHandWrist())
         {
-            if (!m_ControlEnabled)
-            {
-                if (m_SendLeftHand)
-                    SendLine(FormatUnavailable("left", "xr_hand_wrist", false));
-                if (m_SendRightHand)
-                    SendLine(FormatUnavailable("right", "xr_hand_wrist", false));
-            }
-            else if (m_HandSubsystem == null || !m_HandSubsystem.running)
+            if (m_HandSubsystem == null || !m_HandSubsystem.running)
             {
                 SendLine(FormatUnavailable("right", "xr_hand_wrist", false));
             }
             else
             {
+                var leftFistDeadman = IsLeftFistActive(m_HandSubsystem.leftHand);
+
                 if (m_SendLeftHand)
-                    SendHand("left", m_HandSubsystem.leftHand);
+                    SendHand("left", m_HandSubsystem.leftHand, false);
 
                 if (m_SendRightHand)
-                    SendHand("right", m_HandSubsystem.rightHand);
+                    SendHand("right", m_HandSubsystem.rightHand, leftFistDeadman);
             }
         }
 
@@ -187,7 +181,7 @@ public sealed class WristPoseTcpSender : MonoBehaviour
         }
     }
 
-    void SendHand(string handedness, XRHand hand)
+    void SendHand(string handedness, XRHand hand, bool deadman)
     {
         if (!hand.isTracked)
         {
@@ -202,7 +196,7 @@ public sealed class WristPoseTcpSender : MonoBehaviour
             return;
         }
 
-        SendPose(handedness, "xr_hand_wrist", true, pose.position, pose.rotation, false);
+        SendPose(handedness, "xr_hand_wrist", true, pose.position, pose.rotation, deadman);
     }
 
     void SendRightController()
@@ -236,6 +230,60 @@ public sealed class WristPoseTcpSender : MonoBehaviour
         return device.isValid &&
                device.TryGetFeatureValue(CommonUsages.primaryButton, out bool pressed) &&
                pressed;
+    }
+
+    bool IsLeftFistActive(XRHand hand)
+    {
+        if (!hand.isTracked)
+        {
+            m_LeftFistActive = false;
+            return false;
+        }
+
+        if (!TryGetFingerCurl(hand, XRHandJointID.IndexMetacarpal, XRHandJointID.IndexProximal, XRHandJointID.IndexTip, out var indexCurl) ||
+            !TryGetFingerCurl(hand, XRHandJointID.MiddleMetacarpal, XRHandJointID.MiddleProximal, XRHandJointID.MiddleTip, out var middleCurl) ||
+            !TryGetFingerCurl(hand, XRHandJointID.RingMetacarpal, XRHandJointID.RingProximal, XRHandJointID.RingTip, out var ringCurl) ||
+            !TryGetFingerCurl(hand, XRHandJointID.LittleMetacarpal, XRHandJointID.LittleProximal, XRHandJointID.LittleTip, out var littleCurl))
+        {
+            m_LeftFistActive = false;
+            return false;
+        }
+
+        var score = Mathf.Min(Mathf.Min(indexCurl, middleCurl), Mathf.Min(ringCurl, littleCurl));
+        var threshold = m_LeftFistActive ? m_LeftFistOffThreshold : m_LeftFistOnThreshold;
+        m_LeftFistActive = score >= threshold;
+        return m_LeftFistActive;
+    }
+
+    static bool TryGetFingerCurl(
+        XRHand hand,
+        XRHandJointID metacarpalId,
+        XRHandJointID proximalId,
+        XRHandJointID tipId,
+        out float curl)
+    {
+        curl = 0f;
+        if (!TryGetJointPosition(hand, metacarpalId, out var metacarpal) ||
+            !TryGetJointPosition(hand, proximalId, out var proximal) ||
+            !TryGetJointPosition(hand, tipId, out var tip))
+        {
+            return false;
+        }
+
+        var angle = Vector3.Angle(metacarpal - proximal, tip - proximal);
+        curl = Mathf.InverseLerp(155f, 55f, angle);
+        return true;
+    }
+
+    static bool TryGetJointPosition(XRHand hand, XRHandJointID jointId, out Vector3 position)
+    {
+        position = default;
+        var joint = hand.GetJoint(jointId);
+        if (!joint.TryGetPose(out var pose))
+            return false;
+
+        position = pose.position;
+        return true;
     }
 
     void SendPose(string handedness, string source, bool tracked, Vector3 position, Quaternion rotation, bool deadman)
