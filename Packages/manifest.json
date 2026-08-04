@@ -1,6 +1,6 @@
 {
   "dependencies": {
-    "com.ivanmurzak.unity.mcp": "0.81.0",
+    "com.ivanmurzak.unity.mcp": "0.83.1",
     "com.unity.collab-proxy": "2.2.0",
     "com.unity.feature.development": "1.0.1",
     "com.unity.mobile.android-logcat": "1.4.7",
