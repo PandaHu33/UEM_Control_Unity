@@ -3,6 +3,7 @@ using System.IO;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Threading;
 using LibVLCSharp.Shared;
 using UnityEngine;
 #if ENABLE_IL2CPP
@@ -12,11 +13,14 @@ using AOT;
 [DisallowMultipleComponent]
 public sealed class UemNetworkCameraPanel : MonoBehaviour
 {
-    [SerializeField] string streamUrl = "rtsp://192.168.3.10:8554/usb_camera";
+    [SerializeField] string streamUrl = "rtsp://127.0.0.1:8554/usb_camera";
     [SerializeField] Renderer screenRenderer;
     [SerializeField] bool autoStart = true;
-    [SerializeField, Min(0)] int networkCachingMilliseconds = 50;
+    [SerializeField, Min(0)] int networkCachingMilliseconds = 20;
     [SerializeField, Min(0)] int liveCachingMilliseconds = 20;
+    [SerializeField, Min(0.1f)] float staleFrameTimeoutSeconds = 0.5f;
+    [SerializeField, Min(0.5f)] float initialFrameGraceSeconds = 2f;
+    [SerializeField, Min(0.5f)] float reconnectCooldownSeconds = 1f;
     [SerializeField] bool logStatus = true;
     [SerializeField, Min(0.5f)] float statusLogIntervalSeconds = 5f;
     [SerializeField] Color loadingColor = new Color(0.035f, 0.055f, 0.075f, 1f);
@@ -43,6 +47,9 @@ public sealed class UemNetworkCameraPanel : MonoBehaviour
     bool firstVideoFrameLogged;
     string lastStatus;
     DateTime nextStatusLogTimeUtc;
+    DateTime nextReconnectTimeUtc;
+    long streamOpenedUtcTicks;
+    long lastDecodedFrameUtcTicks;
 
     MediaPlayer.LibVLCVideoLockCb lockCallback;
     MediaPlayer.LibVLCVideoUnlockCb unlockCallback;
@@ -123,6 +130,7 @@ public sealed class UemNetworkCameraPanel : MonoBehaviour
     void Update()
     {
         ApplyPendingFrame();
+        RestartIfStreamIsStale();
     }
 
     public void StartStream()
@@ -153,6 +161,8 @@ public sealed class UemNetworkCameraPanel : MonoBehaviour
             LogStatus("StartStream entering LibVLC initialization.");
             InitializeVlcCore();
             CreateVlcPlayer();
+            Interlocked.Exchange(ref streamOpenedUtcTicks, DateTime.UtcNow.Ticks);
+            Interlocked.Exchange(ref lastDecodedFrameUtcTicks, 0);
             OpenVlcMedia();
             openRequested = true;
             LogStatus("Opening RTSP stream with LibVLCSharp: " + streamUrl);
@@ -173,6 +183,8 @@ public sealed class UemNetworkCameraPanel : MonoBehaviour
         openRequested = false;
         firstVideoFormatLogged = false;
         firstVideoFrameLogged = false;
+        Interlocked.Exchange(ref streamOpenedUtcTicks, 0);
+        Interlocked.Exchange(ref lastDecodedFrameUtcTicks, 0);
 
         if (mediaPlayer != null)
         {
@@ -235,8 +247,6 @@ public sealed class UemNetworkCameraPanel : MonoBehaviour
             "--drop-late-frames",
             "--skip-frames",
             "--rtsp-tcp",
-            "--clock-jitter=0",
-            "--clock-synchro=0",
             "--network-caching=" + networkCachingMilliseconds,
             "--live-caching=" + liveCachingMilliseconds
         });
@@ -362,8 +372,6 @@ public sealed class UemNetworkCameraPanel : MonoBehaviour
     {
         media = new Media(libVlc, new Uri(streamUrl), Array.Empty<string>());
         media.AddOption(":rtsp-tcp");
-        media.AddOption(":clock-jitter=0");
-        media.AddOption(":clock-synchro=0");
         media.AddOption(":network-caching=" + networkCachingMilliseconds);
         media.AddOption(":live-caching=" + liveCachingMilliseconds);
         var playResult = mediaPlayer.Play(media);
@@ -514,6 +522,8 @@ public sealed class UemNetworkCameraPanel : MonoBehaviour
             hasNewFrame = true;
         }
 
+        Interlocked.Exchange(ref lastDecodedFrameUtcTicks, DateTime.UtcNow.Ticks);
+
         if (!firstVideoFrameLogged)
         {
             firstVideoFrameLogged = true;
@@ -559,6 +569,34 @@ public sealed class UemNetworkCameraPanel : MonoBehaviour
         videoTexture.LoadRawTextureData(frameToUpload);
         videoTexture.Apply(false, false);
         ApplyTexture(videoTexture);
+    }
+
+    void RestartIfStreamIsStale()
+    {
+        if (!openRequested || mediaPlayer == null)
+            return;
+
+        var now = DateTime.UtcNow;
+        if (now < nextReconnectTimeUtc)
+            return;
+
+        var lastFrameTicks = Interlocked.Read(ref lastDecodedFrameUtcTicks);
+        var referenceTicks = lastFrameTicks > 0
+            ? lastFrameTicks
+            : Interlocked.Read(ref streamOpenedUtcTicks);
+        if (referenceTicks <= 0)
+            return;
+
+        var timeoutSeconds = lastFrameTicks > 0
+            ? staleFrameTimeoutSeconds
+            : initialFrameGraceSeconds;
+        var ageSeconds = TimeSpan.FromTicks(Math.Max(0, now.Ticks - referenceTicks)).TotalSeconds;
+        if (ageSeconds <= timeoutSeconds)
+            return;
+
+        nextReconnectTimeUtc = now.AddSeconds(reconnectCooldownSeconds);
+        LogStatus($"RTSP frame stale for {ageSeconds:0.000}s; restarting to discard queued frames.");
+        RestartStream();
     }
 
     void ReleaseFrameBuffer()
